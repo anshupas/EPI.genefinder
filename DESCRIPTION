@@ -1,0 +1,16 @@
+Package: EPI.genefinder
+Type: Package
+Title: What the Package Does (Title Case)
+Version: 0.1.0
+Author: Who wrote it
+Maintainer: The package maintainer <yourself@somewhere.net>
+Description: More about what it does (maybe more than one line)
+    Use four spaces when indenting paragraphs within the Description.
+License: What license is it under?
+Encoding: UTF-8
+LazyData: true
+Depends: Rcpp (>= 0.12.10), kfoots
+LinkingTo: Rcpp, kfoots
+NeedsCompilation: yes
+Packaged: 2019-10-23 10:23:11 UTC; anshu
+RoxygenNote: 6.1.1

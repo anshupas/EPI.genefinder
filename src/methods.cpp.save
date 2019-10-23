@@ -1,0 +1,432 @@
+#include <Rcpp.h>
+#include "emission_t.h"
+#ifdef SUPPORT_OPENMP
+  #include <omp.h>
+#endif
+
+inline
+double logSumExp(const Rcpp::NumericVector& x){
+  double maxVal = Rcpp::max(x);
+  return maxVal + log(Rcpp::sum(Rcpp::exp(x - maxVal)));
+}
+inline
+double logSumExp(double* ptr, int len){
+  double maxVal = *ptr;
+  for (int i = 1; i < len; i++){
+    if (maxVal < *(ptr + i)){
+      maxVal = *(ptr + i);
+    }
+  }
+  double retVal = 0;
+  for (int i = 0; i < len; i++){
+    retVal += exp(*(ptr + i) - maxVal);
+  }
+  retVal = maxVal + log(retVal);
+  return retVal;
+}
+
+Rcpp::NumericMatrix toLogTransitionMat(const Rcpp::NumericMatrix& transitionMat, bool transpose){
+  Rcpp::NumericMatrix res(transitionMat.nrow(), transitionMat.ncol());
+  if (transpose){
+
+    for (size_t row = 0; row < transitionMat.nrow(); row++){
+      for (size_t col = 0; col < transitionMat.ncol(); col++){
+        res(row, col) = log(transitionMat(col, row));
+      }
+    }
+
+  }
+  else{
+    for (size_t row = 0; row < transitionMat.nrow(); row++){
+      for (size_t col = 0; col < transitionMat.ncol(); col++){
+        res(col, row) = log(transitionMat(col, row));
+      }
+    }
+
+  }
+  return res;
+
+}
+
+
+double forward(
+  // emission related
+  emissionFromIndex_t<double> emissionMat,
+  // transition related
+  const Rcpp::NumericMatrix& transitionMat,
+  const Rcpp::NumericVector& initial,
+  // the model
+  const size_t nHiddenStates,
+  // return
+  mat_t<double> f
+){
+
+  Rcpp::NumericVector tmp(nHiddenStates);
+  int pos = 0;
+  int toHiddenState, fromHiddenState;
+  Rcpp::NumericMatrix logTransitionMat = toLogTransitionMat(transitionMat, false);
+
+  // first position transitions only from start
+  // with transition probability initial
+  double* emissionPtr = emissionMat.vecPtr(pos);
+  double* fPtr = f.colPtr(pos);
+  double* fPtrBefore;
+  for (toHiddenState = 0; toHiddenState < nHiddenStates; toHiddenState++){
+    *(fPtr + toHiddenState) = log(initial(toHiddenState)) + *(emissionPtr + toHiddenState);
+  }
+  pos++;
+
+  for (; pos < f.ncol; pos++){
+    fPtrBefore = fPtr;
+    emissionPtr = emissionMat.vecPtr(pos);
+    fPtr = f.colPtr(pos);
+    for (toHiddenState = 0; toHiddenState < nHiddenStates; toHiddenState++){
+      for (fromHiddenState = 0; fromHiddenState < nHiddenStates; fromHiddenState++){
+        tmp(fromHiddenState) =
+          logTransitionMat(toHiddenState, fromHiddenState)  + *(fPtrBefore + fromHiddenState);
+      }
+
+      *(fPtr + toHiddenState) = logSumExp(tmp) + *(emissionPtr + toHiddenState);
+      //std::cout << pos << '\t' << toHiddenState << '\t' << *(emissionPtr + toHiddenState) << '\n';
+
+    }
+    //std::cout << "F: " << pos << logSumExp(fPtr, f.nrow) << '\n';
+
+  }
+
+  // return loglikelihood
+  return logSumExp(f.colPtr(f.ncol - 1), f.nrow);
+}
+
+void backward(
+    // emission related
+    emissionFromIndex_t<double> emissionMat,
+    // transition related
+    const Rcpp::NumericMatrix& transitionMat,
+    // the model
+    const size_t nHiddenStates,
+    // return
+    mat_t<double> b
+){
+
+  std::cout << b.ncol << '\n';
+  Rcpp::NumericVector tmp(nHiddenStates);
+  int pos = b.ncol - 1;
+  int toHiddenState, fromHiddenState;
+  Rcpp::NumericMatrix logTransitionMat = toLogTransitionMat(transitionMat, true);
+  double* emissionPtr;
+  double* bPtr;
+  double* bPtrBefore = b.colPtr(pos);
+  pos--;
+  for (;pos >= 0; pos--){
+    bPtr = b.colPtr(pos);
+    emissionPtr = emissionMat.vecPtr(pos + 1);
+    for (toHiddenState = 0; toHiddenState < nHiddenStates; toHiddenState++){
+      tmp[toHiddenState] = *(emissionPtr + toHiddenState) + *(bPtrBefore + toHiddenState);
+    }
+    for (fromHiddenState = 0; fromHiddenState < nHiddenStates; fromHiddenState++){
+      *(bPtr + fromHiddenState) =
+        logSumExp(tmp + logTransitionMat(fromHiddenState, Rcpp::_));
+    }
+    bPtrBefore = bPtr;
+    //std::cout << pos << '\t' << logSumExp(bPtr, b.nrow) << '\n';
+    //std::cout << start << '\t' << pos << '\t' << logSumExp(b(Rcpp::_, pos)) << '\n';
+  }
+  std::cout << "\n\n";
+}
+
+// baum-welch
+
+void baumWelch_core(
+    const Rcpp::List& index,
+    size_t nFeatures,
+    size_t nObservations,
+    const Rcpp::IntegerVector& starts,
+    const Rcpp::IntegerVector& ends,
+    size_t nContigs,
+    Rcpp::NumericMatrix& emissionProb,
+    const Rcpp::LogicalVector& updateEmission,
+    Rcpp::NumericMatrix& transitionMat,
+    const Rcpp::LogicalMatrix& updateTransition,
+
+    Rcpp::NumericVector& initial,
+    size_t nHiddenStates,
+    Rcpp::NumericMatrix& f,
+    Rcpp::NumericMatrix& b,
+    size_t maxIter
+
+
+){
+  size_t nthreads = 1;
+  size_t contig;
+  size_t feature;
+  size_t hiddenState;
+  size_t fromHiddenState;
+  size_t toHiddenState;
+  Rcpp::NumericVector likelihood(nContigs);
+  Rcpp::IntegerVector map = Rcpp::as<Rcpp::IntegerVector>(index["map"]);
+  Rcpp::IntegerMatrix observation = Rcpp::as<Rcpp::IntegerMatrix>(index["observation"]);
+
+  emissionFromIndex_t<int> observationMat(observation.begin(),
+    observation.ncol(), observation.nrow(), map.begin());
+
+  mat_t<double> F(f.begin(), f.nrow(), f.ncol());
+  mat_t<double> B(b.begin(), b.nrow(), b.ncol());
+
+  int* observationPtr;
+  double currentPost;
+  double lastLlik = -1e-300;
+  for (size_t iter = 0; iter < maxIter; iter++){
+    // calculate emissions
+    // iterate over hiddenStates
+    std::cout << "creating emission Tab\n";
+    Rcpp::NumericMatrix emissionTab(nHiddenStates, nObservations);
+    for (hiddenState = 0; hiddenState < nHiddenStates; hiddenState++){
+      emissionTab(hiddenState, Rcpp::_)= emission(index, emissionProb(Rcpp::_, hiddenState));
+    }
+    emissionFromIndex_t<double> emissionMat(emissionTab.begin(),
+                                            emissionTab.nrow(), emissionTab.ncol(), map.begin());
+
+
+    std::cout << "forward/backward\n";
+    // forward/backward
+    #pragma omp parallel for num_threads(nthreads)
+    for (contig = 0; contig < nContigs; contig++){
+      mat_t<double> fsub = F.subsetCol(starts(contig), ends(contig));
+      mat_t<double> bsub = B.subsetCol(starts(contig), ends(contig));
+      emissionFromIndex_t<double> emissionMatsub = emissionMat.subsetCol(starts(contig));
+      likelihood(contig) = forward(emissionMatsub, transitionMat, initial,
+        nHiddenStates, fsub);
+      std::cout << "asd\n";
+      backward(emissionMatsub, transitionMat,
+        nHiddenStates, bsub);
+      std::cout << contig << '\t' << likelihood[contig] << '\n';
+
+    }
+    std::cout << "update emissions\n";
+    // update emissions
+    contig = 0;
+    double currentLikelihood = likelihood[0];
+    Rcpp::NumericMatrix newEmissionProb(nFeatures, nHiddenStates);
+    Rcpp::NumericVector postHiddenStates(nHiddenStates);
+
+    for (size_t pos = 0; pos < f.ncol(); pos++){
+      if (pos > ends[contig]){
+        contig++;
+        currentLikelihood = likelihood[contig];
+      }
+      observationPtr = observationMat.vecPtr(pos);
+
+      for (hiddenState = 0; hiddenState < nHiddenStates; hiddenState++){
+        currentPost = exp(f(hiddenState, pos) + b(hiddenState, pos) - currentLikelihood);
+        if (currentPost > 1){
+          //std::cout << pos << '\t' << currentPost << '\n';
+        }
+        postHiddenStates[hiddenState] += currentPost;
+        if (updateEmission[hiddenState]){
+          //currentPost = exp(f(hiddenState, pos) + b(hiddenState, pos) - currentLikelihood);
+          //postHiddenStates[hiddenState] += currentPost;
+          for (feature = 0; feature < nFeatures; feature++){
+            if (*(observationPtr + feature) == 1){
+              newEmissionProb(feature, hiddenState) += currentPost;
+
+            }
+          }
+
+        }
+      }
+
+    }
+    Rcpp::Rcout << "hiddenStates: " << postHiddenStates << std::endl;
+
+    for (hiddenState = 0; hiddenState < nHiddenStates; hiddenState++){
+      if (updateEmission[hiddenState]){
+        newEmissionProb(Rcpp::_, hiddenState) = newEmissionProb(Rcpp::_, hiddenState) / postHiddenStates[hiddenState];
+      }
+      else{
+        newEmissionProb(Rcpp::_, hiddenState) = emissionProb(Rcpp::_, hiddenState);
+      }
+    }
+
+    double llik = Rcpp::sum(likelihood);
+    if (llik - lastLlik < 0.01){
+
+    }
+    std::cout << iter << '\t' << llik << std::endl;
+    std::cout << "update transitions\n";
+    //update transitions
+
+    Rcpp::NumericVector newInitial(initial.size(), 0);
+    Rcpp::NumericMatrix newTransitionMat(transitionMat.nrow(), transitionMat.ncol());
+
+    contig = 0;
+    currentLikelihood = likelihood[0];
+
+    double* emissionPtr;
+    Rcpp::NumericMatrix logTransitionMat = toLogTransitionMat(transitionMat, false);
+    for (size_t pos = 0; pos < f.ncol(); pos++){
+
+      if (pos > ends[contig]){
+        contig++;
+        currentLikelihood = likelihood[contig];
+      }
+      if (pos == starts[contig]){
+        newInitial = newInitial + Rcpp::exp(f(Rcpp::_, pos) + b(Rcpp::_, pos) - currentLikelihood);
+      }
+      else{
+        emissionPtr = emissionMat.vecPtr(pos);
+
+        for (fromHiddenState = 0; fromHiddenState < nHiddenStates; fromHiddenState++){
+          for (toHiddenState = 0; toHiddenState < nHiddenStates; toHiddenState++){
+            if (updateTransition(toHiddenState, fromHiddenState)){
+              newTransitionMat(toHiddenState, fromHiddenState)
+                += exp(
+                    f(fromHiddenState, pos - 1)
+                    + logTransitionMat(toHiddenState, fromHiddenState)
+                    + *(emissionPtr + toHiddenState)
+                    + b(toHiddenState, pos)
+                    - currentLikelihood
+                   );
+
+            }
+          }
+        }
+      }
+
+    } // for (size_t pos = 0; pos < f.ncol(); pos++)
+    Rcpp::NumericVector transitionSum(nHiddenStates);
+    for (hiddenState = 0; hiddenState < nHiddenStates; hiddenState++){
+      transitionSum[hiddenState] = Rcpp::sum(newTransitionMat(Rcpp::_, hiddenState));
+    }
+
+    for (fromHiddenState = 0; fromHiddenState < nHiddenStates; fromHiddenState++){
+      for (toHiddenState = 0; toHiddenState < nHiddenStates; toHiddenState++){
+        if (updateTransition(toHiddenState, fromHiddenState)){
+          newTransitionMat(toHiddenState, fromHiddenState) /= transitionSum(fromHiddenState);
+        }
+        else{
+          newTransitionMat(toHiddenState, fromHiddenState) = transitionMat(toHiddenState, fromHiddenState);
+        }
+      }
+
+    }
+    Rcpp::Rcout << "initial: " ;
+    Rcpp::Rcout << newInitial << std::endl;
+    // copy
+    emissionProb = newEmissionProb;
+    initial = newInitial / Rcpp::sum(newInitial);
+    transitionMat = newTransitionMat;
+    lastLlik = llik;
+
+  } // for (size_t iter = 0; iter < maxIter; iter++)
+
+}
+// [[Rcpp::export]]
+Rcpp::List baumWelch(
+    const Rcpp::List& index,
+    size_t nFeatures,
+    size_t nObservations,
+    const Rcpp::IntegerVector& starts,
+    const Rcpp::IntegerVector& ends,
+    size_t nContigs,
+
+    Rcpp::NumericMatrix& emissionProb,
+    const Rcpp::LogicalVector& updateEmission,
+    Rcpp::NumericMatrix& transitionMat,
+    const Rcpp::LogicalMatrix& updateTransition,
+
+    Rcpp::NumericVector& initial,
+    size_t nHiddenStates,
+    size_t nPos,
+    size_t maxIter = 20
+){
+  Rcpp::NumericMatrix f(nHiddenStates, nPos);
+  Rcpp::NumericMatrix b(nHiddenStates, nPos);
+  baumWelch_core(index, nFeatures, nObservations, starts, ends, nContigs, emissionProb, updateEmission,
+                 transitionMat, updateTransition, initial, nHiddenStates, f, b, maxIter);
+  return Rcpp::List::create(
+    Rcpp::Named("emissionProb")= emissionProb,
+    Rcpp::Named("transitionMat") = transitionMat,
+    Rcpp::Named("initial") = initial
+  );
+
+}
+// [[Rcpp::export]]
+Rcpp::IntegerVector viterbi(
+  const Rcpp::List& index,
+  size_t nFeatures,
+  size_t nObservations,
+  const Rcpp::IntegerVector& starts,
+  const Rcpp::IntegerVector& ends,
+  size_t nContigs,
+  Rcpp::NumericMatrix& emissionProb,
+  Rcpp::NumericMatrix& transitionMat,
+
+  Rcpp::NumericVector& initial,
+  size_t nHiddenStates,
+  size_t nPos
+){
+  Rcpp::IntegerVector map = Rcpp::as<Rcpp::IntegerVector>(index["map"]);
+  Rcpp::NumericMatrix v(nHiddenStates, nPos);
+  Rcpp::IntegerMatrix ptr(nHiddenStates, nPos);
+  size_t pos;
+  size_t hiddenState;
+  size_t fromHiddenState;
+  size_t maxHiddenState;
+  Rcpp::NumericMatrix logTransitionMat = toLogTransitionMat(transitionMat, false);
+  Rcpp::NumericMatrix emissionTab(nHiddenStates, nObservations);
+  std::cout << "creating emission Tab\n";
+  for (hiddenState = 0; hiddenState < nHiddenStates; hiddenState++){
+    emissionTab(hiddenState, Rcpp::_)= emission(index, emissionProb(Rcpp::_, hiddenState));
+  }
+
+  emissionFromIndex_t<double> emissionMat(emissionTab.begin(),
+                                          emissionTab.ncol(), emissionTab.nrow(), map.begin());
+  size_t contig;
+  double* emissionPtr;
+  Rcpp::NumericVector tmp(nHiddenStates);
+  Rcpp::IntegerVector stateSequence(nPos);
+  for (contig = 0; contig < nContigs; contig++){
+    // first iteration
+    pos = starts[contig];
+    emissionPtr = emissionMat.vecPtr(pos);
+    for (hiddenState = 0; hiddenState < nHiddenStates; hiddenState++){
+      v(hiddenState, pos) = log(initial(hiddenState)) + *(emissionPtr + hiddenState);
+      ptr(hiddenState,pos) = -1;
+    }
+    pos++;
+
+    for ( ; pos <= ends[contig]; pos++){
+      emissionPtr = emissionMat.vecPtr(pos);
+      for (hiddenState = 0; hiddenState < nHiddenStates; hiddenState++){
+        tmp = logTransitionMat(hiddenState, Rcpp::_) + v(Rcpp::_, pos - 1);
+        maxHiddenState = 0;
+
+        for (fromHiddenState = 1; fromHiddenState < nHiddenStates; fromHiddenState++){
+          if (tmp[fromHiddenState] > tmp[maxHiddenState]){
+            maxHiddenState = fromHiddenState;
+          }
+
+        }
+        v(hiddenState, pos) = *(emissionPtr + hiddenState) + tmp[maxHiddenState];
+        ptr(hiddenState,pos) = maxHiddenState;
+      }
+    }
+    // backtrace
+    pos = ends[contig];
+    maxHiddenState = 0;
+    for (hiddenState = 0; hiddenState < nHiddenStates; hiddenState++){
+      if (v(hiddenState, pos) > v(maxHiddenState, pos)){
+        maxHiddenState = hiddenState;
+      }
+    }
+    stateSequence[pos] = maxHiddenState;
+
+    for (; pos > starts[contig]; pos--){
+      maxHiddenState = ptr(maxHiddenState, pos);
+      stateSequence[pos - 1] = maxHiddenState;
+    }
+
+  }
+  return stateSequence + 1;
+}
