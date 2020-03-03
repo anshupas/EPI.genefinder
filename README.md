@@ -15,7 +15,7 @@ devtools::install_github("lamortenera/kfoots")
 To install `EPI.genefinder` type:
 
 ```R
-devtools::install_github("imbeLab/EPI.genefinder")
+devtools::install_github("imbbLab/EPI.genefinder")
 ```
 ## Contact
 ho.chung [at] staff [dot] uni-marburg [dot] de\
